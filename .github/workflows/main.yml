@@ -5,135 +5,267 @@ on:
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    # máximo permitido para runners hospedados pelo GitHub
     timeout-minutes: 360
 
+    env:
+      # tempo entre tentativas (segundos)
+      RETRY_SLEEP: 5
+      # número máximo de tentativas para esperar IP / conectar
+      MAX_RETRIES: 24
+
     steps:
-      - name: Configure Core RDP Settings (secure)
+      - name: Fail fast if not admin
         run: |
-          # Enable Remote Desktop
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name "fDenyTSConnections" -Value 0 -Force
+          pwsh -NoProfile -NonInteractive -Command {
+            $ErrorActionPreference='Stop'
+            try {
+              $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+              if (-not $isAdmin) {
+                Write-Error "Script requires Administrator privileges. GitHub-hosted runners normally run as Admin, but check environment."
+                exit 1
+              }
+              Write-Host "Running as Administrator."
+            } catch {
+              Write-Error "Privilege check failed: $_"
+              exit 1
+            }
+          }
 
-          # Keep NLA and a secure SecurityLayer (do NOT disable these if using Tailscale)
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "UserAuthentication" -Value 1 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "SecurityLayer" -Value 2 -Force
+      - name: Configure Core RDP Settings (secure + safe checks)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          try {
+            Write-Host "Enabling Remote Desktop (registry flags)..."
+            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
 
-          # Remove any existing rule with the same name to avoid duplication
-          netsh advfirewall firewall delete rule name="RDP-Tailscale" || Write-Host "no existing rule to delete"
+            Write-Host "Ensuring NLA and SecurityLayer..."
+            $rdpKey = 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
+            if (-not (Test-Path $rdpKey)) {
+              Write-Host "RDP registry key not present. This runner may not support full RDP configuration. Continuing but RDP may not be available."
+            } else {
+              Set-ItemProperty -Path $rdpKey -Name "UserAuthentication" -Value 1 -Force
+              Set-ItemProperty -Path $rdpKey -Name "SecurityLayer" -Value 2 -Force
+            }
 
-          # Only allow RDP from the Tailscale IP range (Tailscale uses 100.64.0.0/10)
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389 remoteip=100.64.0.0/10
+            # Firewall rule management - remove old rule if exists, then add
+            $ruleName = "RDP-Tailscale"
+            Write-Host "Removing old firewall rule (if exists)..."
+            try { netsh advfirewall firewall delete rule name="$ruleName" } catch { Write-Host "Delete rule attempted; may not exist." }
+            Write-Host "Adding firewall rule to allow localport 3389 from 100.64.0.0/10 (Tailscale)."
+            netsh advfirewall firewall add rule name="$ruleName" dir=in action=allow protocol=TCP localport=3389 remoteip=100.64.0.0/10 profile=any
 
-          # Ensure Remote Desktop service is running
-          Start-Service -Name TermService -ErrorAction Stop
+            Write-Host "Starting Remote Desktop Service (TermService) if present..."
+            try {
+              if (Get-Service -Name TermService -ErrorAction SilentlyContinue) {
+                Start-Service -Name TermService -ErrorAction Stop
+                Write-Host "TermService started."
+              } else {
+                Write-Host "TermService not found on this runner."
+              }
+            } catch {
+              Write-Warning "Could not (re)start TermService: $_"
+            }
+
+            Write-Host "RDP core configuration complete."
+          } catch {
+            Write-Error "Failed to configure RDP settings: $_"
+            exit 1
+          }
 
       - name: Create or update RDP local user (fixed password from secret)
+        shell: pwsh
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          if (-not $env:RDP_PASSWORD) {
-            Write-Error "RDP_PASSWORD secret is not set"
+          $ErrorActionPreference = 'Stop'
+          try {
+            if (-not $env:RDP_PASSWORD) {
+              Write-Error "RDP_PASSWORD secret is not set"
+              exit 1
+            }
+
+            # Create secure string (don't echo password)
+            $securePass = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+
+            if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+              Write-Host "User 'RDP' exists — updating password."
+              Set-LocalUser -Name "RDP" -Password $securePass
+            } else {
+              Write-Host "Creating user 'RDP'."
+              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -FullName "RDP Access" -PasswordNeverExpires
+            }
+
+            # Add to groups safely
+            $groups = @("Remote Desktop Users","Administrators")
+            foreach ($g in $groups) {
+              try {
+                Add-LocalGroupMember -Group $g -Member "RDP" -ErrorAction Stop
+                Write-Host "Added RDP to group: $g"
+              } catch {
+                Write-Warning "Could not add to group $g or already member: $_"
+              }
+            }
+
+            # verify
+            if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+              Write-Error "User creation/update failed"
+              exit 1
+            } else {
+              Write-Host "User RDP ready (password kept secret)."
+            }
+          } catch {
+            Write-Error "User creation failed: $_"
             exit 1
           }
 
-          $securePass = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
-
-          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
-              Write-Host "User RDP exists — updating password"
-              Set-LocalUser -Name "RDP" -Password $securePass
-          } else {
-              Write-Host "Creating user RDP"
-              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -FullName "RDP Access"
-          }
-
-          # Add to groups: Remote Desktop Users + Administrators
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
-
-          # Sanity check (no password printed)
-          if (-not (Get-LocalUser -Name "RDP")) {
-              Write-Error "User creation/update failed"
-              exit 1
-          } else {
-              Write-Host "User RDP is ready (password kept secret)."
-          }
-
-      - name: Install Tailscale
+      - name: Install Tailscale (robust download + retries)
+        shell: pwsh
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
+          $ErrorActionPreference = 'Stop'
+          try {
+            # Prefer official stable msi path. If this URL changes upstream, adjust manually.
+            $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+            $installerPath = Join-Path $env:TEMP "tailscale.msi"
 
-      - name: Establish Tailscale Connection
+            $maxAttempts = 5
+            $attempt = 0
+            $success = $false
+            while (-not $success -and $attempt -lt $maxAttempts) {
+              $attempt++
+              Write-Host "Downloading Tailscale (attempt $attempt of $maxAttempts)..."
+              try {
+                Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing -TimeoutSec 120
+                $success = $true
+              } catch {
+                Write-Warning "Download failed: $_. Retrying in 5s..."
+                Start-Sleep -Seconds 5
+              }
+            }
+            if (-not $success) { throw "Failed to download Tailscale after $maxAttempts attempts." }
+
+            Write-Host "Installing Tailscale..."
+            Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+            Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+
+            # sanity check
+            $exe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+            if (-not (Test-Path $exe)) {
+              throw "tailscale.exe not found after install at $exe"
+            }
+            Write-Host "Tailscale installed: $exe"
+          } catch {
+            Write-Error "Failed to install Tailscale: $_"
+            exit 1
+          }
+
+      - name: Establish Tailscale Connection (up with authkey) and wait for IP
+        shell: pwsh
         env:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          if (-not $env:TAILSCALE_AUTH_KEY) {
-            Write-Error "TAILSCALE_AUTH_KEY secret is not set"
-            exit 1
-          }
-
-          $exe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
-          if (-not (Test-Path $exe)) {
-            Write-Error "tailscale.exe not found at $exe"
-            exit 1
-          }
-
-          # Use a unique-ish hostname for visibility in the admin panel
-          & $exe up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-runner-$env:GITHUB_RUN_ID
-
-          # Wait for Tailscale IPv4 address (tries a few times)
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 12) {
-              $tsIP = (& $exe ip -4) -join " "
-              if ($tsIP) { break }
-              Start-Sleep -Seconds 5
-              $retries++
-          }
-
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
+          $ErrorActionPreference = 'Stop'
+          try {
+            if (-not $env:TAILSCALE_AUTH_KEY) {
+              Write-Error "TAILSCALE_AUTH_KEY secret is not set"
               exit 1
-          }
+            }
 
-          # Trim/choose the first address (safe for most cases)
-          $firstIp = ($tsIP -split '\s+' | Select-Object -First 1).Trim()
-          echo "TAILSCALE_IP=$firstIp" >> $env:GITHUB_ENV
-          Write-Host "Tailscale IP: $firstIp"
+            $exe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+            if (-not (Test-Path $exe)) {
+              Write-Error "tailscale.exe not found at $exe"
+              exit 1
+            }
+
+            $hostname = "gh-runner-$env:GITHUB_RUN_ID"
+            Write-Host "Bringing tailscale up with hostname $hostname (authkey hidden)."
+            & $exe up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=$hostname --accept-routes 2>&1 | Out-String | Write-Host
+
+            # wait for IPv4 address
+            $retries = 0
+            $tsIP = $null
+            while (-not $tsIP -and $retries -lt $env:MAX_RETRIES) {
+              $retries++
+              try {
+                $ips = (& $exe ip -4) -join " "
+                if ($ips -and $ips.Trim() -ne "") {
+                  $tsIP = ($ips -split '\s+' | Where-Object { $_ -match '\d+\.\d+\.\d+\.\d+' } | Select-Object -First 1)
+                  if ($tsIP) { break }
+                }
+              } catch {
+                Write-Warning "tailscale ip call failed on attempt $retries: $_"
+              }
+              Write-Host "Waiting for Tailscale IP (attempt $retries)..."
+              Start-Sleep -Seconds $env:RETRY_SLEEP
+            }
+
+            if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned within expected time. Check authkey and network connectivity."
+              exit 1
+            }
+
+            Write-Host "Tailscale IP: $tsIP"
+            # export to GitHub env
+            Add-Content -Path $env:GITHUB_ENV -Value "TAILSCALE_IP=$tsIP"
+          } catch {
+            Write-Error "Failed to bring Tailscale up: $_"
+            exit 1
+          }
 
       - name: Verify RDP Accessibility (via Tailscale)
+        shell: pwsh
         run: |
-          if (-not $env:TAILSCALE_IP) {
-            Write-Error "No TAILSCALE_IP available"
+          $ErrorActionPreference = 'Stop'
+          try {
+            $ip = $env:TAILSCALE_IP
+            if (-not $ip) {
+              Write-Error "No TAILSCALE_IP available in environment"
+              exit 1
+            }
+            Write-Host "Testing TCP connectivity to $ip:3389"
+            $ok = $false
+            $tries = 0
+            while (-not $ok -and $tries -lt $env:MAX_RETRIES) {
+              $tries++
+              $t = Test-NetConnection -ComputerName $ip -Port 3389 -WarningAction SilentlyContinue
+              if ($t.TcpTestSucceeded) { $ok = $true; break }
+              Write-Host "Connection test failed (attempt $tries). Sleeping $env:RETRY_SLEEP s..."
+              Start-Sleep -Seconds $env:RETRY_SLEEP
+            }
+            if (-not $ok) {
+              Write-Error "TCP connection to RDP port 3389 failed after $tries attempts. RDP may be blocked or not enabled."
+              exit 1
+            }
+            Write-Host "TCP connectivity to RDP is OK."
+          } catch {
+            Write-Error "RDP verification failed: $_"
             exit 1
           }
-          Write-Host "Testing TCP connectivity to $env:TAILSCALE_IP:3389"
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
-              exit 1
+
+      - name: Publish connection info (address only, no secrets)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          try {
+            Write-Host "`n=== RDP ACCESS ==="
+            Write-Host "Address (Tailscale): $env:TAILSCALE_IP"
+            Write-Host "Username: RDP"
+            Write-Host "Password: (stored in repo secret; not shown in logs)"
+            Write-Host "==================`n"
+          } catch {
+            Write-Warning "Could not publish connection info: $_"
           }
-          Write-Host "TCP connectivity successful!"
 
-      - name: Publish connection info (address only)
+      - name: Maintain Connection (keep runner busy until timeout; exit gracefully on ctrl-c)
+        shell: pwsh
         run: |
-          # Print connection info (do NOT print the password)
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address (Tailscale): $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: (stored in repo secret; not shown in logs)"
-          Write-Host "==================`n"
-
-      - name: Maintain Connection (keep runner busy until timeout)
-        run: |
-          while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - runner will stop at workflow timeout"
+          $ErrorActionPreference = 'Continue'
+          Write-Host "Entering maintenance loop. This will keep the runner alive until the workflow times out or is cancelled."
+          try {
+            while ($true) {
+              Write-Host "[$(Get-Date -Format o)] RDP Active"
               Start-Sleep -Seconds 300
+            }
+          } finally {
+            Write-Host "Maintenance loop exiting (workflow ended or cancelled)."
           }
